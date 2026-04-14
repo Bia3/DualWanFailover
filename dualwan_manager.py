@@ -49,6 +49,7 @@ from typing import Dict, List, Optional, Tuple
 import ipaddress
 
 NETWORK_DIR = Path('/etc/systemd/network')
+HOSTS_FILE = Path('/etc/hosts')
 
 @dataclass
 class IfaceResult:
@@ -86,7 +87,7 @@ def discover_interfaces() -> List[str]:
         # Determine iface name
         name = None
         # Try parse from filename pattern xx-<iface>.network*
-        m = re.match(r'.*/\\d+-(.+?)\\.network', str(p))
+        m = re.match(r'.*/\d+-(.+?)\.network', str(p))
         if m:
             name = m.group(1)
         # Try parse Name= from file
@@ -233,10 +234,10 @@ def get_public_ip_via_iface(iface: str) -> str:
     if rc != 0:
         raise RuntimeError(f"Failed to detect public IP via {iface}: {err or out}")
     ip = out.strip()
-    # Basic IPv4 validation
+    # Strict IPv4 validation using ipaddress
     try:
-        socket.inet_aton(ip)
-    except OSError:
+        ipaddress.IPv4Address(ip)
+    except ipaddress.AddressValueError:
         raise RuntimeError(f"Invalid IP returned by discovery service: {ip}")
     return ip
 
@@ -283,12 +284,11 @@ class CloudflareClient:
 
     def find_best_zone_for_fqdn(self, fqdn: str) -> Tuple[Optional[str], Optional[str]]:
         parts = fqdn.rstrip('.').split('.')
-        # Try progressively from apex assumption
-        for i in range(len(parts) - 1):
-            candidate = '.'.join(parts[i:])  # start from left? We want rightmost labels; adjust
-        # Correct approach: iterate suffixes from 2-label up to full
-        suffixes = ['.'.join(parts[j:]) for j in range(len(parts) - 2, -1, -1)]
+        # Iterate suffixes from longest to shortest (min two labels)
+        suffixes = ['.'.join(parts[i:]) for i in range(1, len(parts))]  # e.g., sub.example.com, example.com, com
         for zone in suffixes:
+            if zone.count('.') < 1:  # skip TLD-only
+                continue
             z_id = self.get_zone_id(zone)
             if z_id:
                 return zone, z_id
@@ -312,9 +312,76 @@ class CloudflareClient:
 
 
 def parse_targets(env_value: Optional[str]) -> List[str]:
-    if not env_value:
-        return ['1.1.1.1', '8.8.8.8']
-    return [s.strip() for s in env_value.split(',') if s.strip()]
+    # Build a list of safe targets (IPv4 or hostname) to ping.
+    # Rules:
+    # - Reject any target that starts with '-'
+    # - From /etc/hosts, only consider lines with a global IPv4; prefer hostnames containing a dot; if none, fall back to the IP
+    # - Cap total number of targets to 20
+    # - Deduplicate while preserving order
+    def _is_safe_target(t: str) -> bool:
+        return bool(t) and not t.startswith('-')
+
+    seen = set()
+    targets: List[str] = []
+
+    # Parse /etc/hosts to discover sane defaults
+    if HOSTS_FILE.exists():
+        try:
+            with HOSTS_FILE.open('r') as file:
+                for raw in file:
+                    line = raw.split('#', 1)[0].strip()
+                    if not line:
+                        continue
+                    toks = line.split()
+                    if len(toks) < 2:
+                        continue
+                    ip_str = toks[0]
+                    try:
+                        ip = ipaddress.IPv4Address(ip_str)
+                    except ipaddress.AddressValueError:
+                        continue
+                    if not ip.is_global:
+                        continue
+                    # Accept hostnames with a dot and not starting with '-'
+                    hostnames = [h for h in toks[1:] if ('.' in h and _is_safe_target(h))]
+                    candidates = hostnames if hostnames else [ip_str]
+                    for c in candidates:
+                        if c not in seen and _is_safe_target(c):
+                            seen.add(c)
+                            targets.append(c)
+                            if len(targets) >= 20:
+                                break
+                    if len(targets) >= 20:
+                        break
+        except Exception as e:
+            log(f"Warning: Failed to read {HOSTS_FILE}: {e}", True)
+
+    # Add targets from environment if provided
+    if env_value:
+        for s in env_value.split(','):
+            t = s.strip()
+            if not _is_safe_target(t):
+                continue
+            # Accept either IPv4 (any), or hostname with a dot
+            ok = False
+            try:
+                # Allow any syntactically valid IPv4; ping will decide reachability
+                ipaddress.IPv4Address(t)
+                ok = True
+            except ipaddress.AddressValueError:
+                ok = ('.' in t)
+            if ok and t not in seen:
+                seen.add(t)
+                targets.append(t)
+                if len(targets) >= 20:
+                    break
+
+    # Fallback to default targets if none found
+    if not targets:
+        targets = ['1.1.1.1', '8.8.8.8']
+
+    # Final cap and return
+    return targets[:20]
 
 
 def main() -> int:
